@@ -1,44 +1,135 @@
 <?php
-// Configuración de seguridad inicial
+// ======================================
+// CONFIGURACIÓN INICIAL (SEGURIDAD/SESIONES)
+// ======================================
+
+// Configuración de ejecución
+set_time_limit(30);
+ini_set('memory_limit', '128M');
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__.'/php-errors.log');
+
+// Verificar requisitos
+if (!function_exists('json_decode')) {
+    die("Error: Extensión JSON no está instalada");
+}
+
+// Configuración de seguridad HTTP
 header("X-Frame-Options: DENY");
 header("X-Content-Type-Options: nosniff");
 header("X-XSS-Protection: 1; mode=block");
 header("Referrer-Policy: strict-origin-when-cross-origin");
 
-// Inicio de sesión seguro
+// Configuración de sesión segura
+$isSecure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || $_SERVER['SERVER_PORT'] == 443;
+
+if (!file_exists(__DIR__.'/sessions')) {
+    mkdir(__DIR__.'/sessions', 0755);
+}
+
 session_start([
-    'cookie_lifetime' => 86400, // 1 día
-    'cookie_secure' => isset($_SERVER['HTTPS']),
+    'cookie_lifetime' => 86400,
+    'cookie_secure' => $isSecure,
     'cookie_httponly' => true,
     'use_strict_mode' => true,
-    'cookie_samesite' => 'Lax'
+    'cookie_samesite' => 'Lax',
+    'save_path' => __DIR__.'/sessions'
 ]);
 
-// Configuración
+// ======================================
+// CONFIGURACIÓN GENERAL
+// ======================================
 $uploads_dir = "uploads/";
 $allowed_image_types = ['jpg', 'jpeg', 'png', 'gif'];
-$max_file_size = 5 * 1024 * 1024; // 5MB
-$google_maps_api_key = "TU_API_KEY_GOOGLE_MAPS"; // Reemplaza con tu API key
-
-// Directorios y archivos
+$max_file_size = 5 * 1024 * 1024;
+$google_maps_api_key = "AIzaSyDt_rhgIYlQ1EtpUGUv6j0R3InUzmwD3EE";
 $data_dir = "data/";
+
+// Crear directorios con verificación
 if (!file_exists($data_dir)) {
-    mkdir($data_dir, 0755, true);
+    if (!mkdir($data_dir, 0755, true)) {
+        error_log("No se pudo crear directorio: $data_dir");
+        die("Error crítico: No se pudo crear directorio de datos");
+    }
+    chmod($data_dir, 0755);
 }
+
 if (!file_exists($uploads_dir)) {
-    mkdir($uploads_dir, 0755, true);
+    if (!mkdir($uploads_dir, 0755, true)) {
+        error_log("No se pudo crear directorio: $uploads_dir");
+        die("Error crítico: No se pudo crear directorio de uploads");
+    }
+    chmod($uploads_dir, 0755);
 }
 
 $users_file = $data_dir . "users.json";
 $controles_file = $data_dir . "controles.json";
 $camuflados_file = $data_dir . "camuflados.json";
 
-// Inicializar archivos si no existen
-if (!file_exists($users_file)) file_put_contents($users_file, '[]');
-if (!file_exists($controles_file)) file_put_contents($controles_file, '[]');
-if (!file_exists($camuflados_file)) file_put_contents($camuflados_file, '[]');
+// ======================================
+// FUNCIONES MEJORADAS PARA MANEJO DE JSON
+// ======================================
 
-// Funciones de seguridad
+function safe_json_read($file) {
+    if (!file_exists($file)) {
+        file_put_contents($file, '[]');
+        return [];
+    }
+
+    $content = @file_get_contents($file);
+    if ($content === false) {
+        error_log("Error al leer archivo: $file");
+        return [];
+    }
+
+    $data = @json_decode($content, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // Intenta reparar JSON corrupto
+        $content = preg_replace('/[^\x20-\x7F]/', '', $content);
+        $data = json_decode($content, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $backup = $file . '.corrupt.' . time();
+            rename($file, $backup);
+            error_log("JSON corrupto: $file - Backup creado en: $backup");
+            file_put_contents($file, '[]');
+            return [];
+        }
+    }
+    return is_array($data) ? $data : [];
+}
+
+function safe_json_write($file, $data) {
+    $temp = tempnam(dirname($file), 'tmp');
+    if ($temp === false) {
+        error_log("Error al crear archivo temporal para: $file");
+        return false;
+    }
+
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    if ($json === false) {
+        error_log("Error al codificar JSON para: $file");
+        unlink($temp);
+        return false;
+    }
+
+    if (file_put_contents($temp, $json) === false) {
+        error_log("Error al escribir en archivo temporal: $temp");
+        unlink($temp);
+        return false;
+    }
+
+    if (!rename($temp, $file)) {
+        error_log("Error al renombrar archivo temporal: $temp -> $file");
+        unlink($temp);
+        return false;
+    }
+
+    chmod($file, 0644);
+    return true;
+}
+
 function sanitizeInput($data) {
     return htmlspecialchars(trim($data), ENT_QUOTES, 'UTF-8');
 }
@@ -60,7 +151,9 @@ function validateCSRFToken($token) {
     return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
 }
 
-// Procesamiento de formularios
+// ======================================
+// PROCESAMIENTO DE FORMULARIOS
+// ======================================
 $error = '';
 $success = '';
 
@@ -71,13 +164,14 @@ if (isset($_POST['register'])) {
     } else {
         $username = sanitizeInput($_POST['username']);
         $password = $_POST['password'];
+        $telefono = sanitizeInput($_POST['telefono'] ?? '');
 
         if (strlen($username) < 4 || strlen($username) > 20) {
             $error = "El usuario debe tener entre 4 y 20 caracteres.";
         } elseif (strlen($password) < 8) {
             $error = "La contraseña debe tener al menos 8 caracteres.";
         } else {
-            $users = json_decode(file_get_contents($users_file), true);
+            $users = safe_json_read($users_file);
 
             foreach ($users as $user) {
                 if ($user['username'] === $username) {
@@ -86,21 +180,30 @@ if (isset($_POST['register'])) {
                 }
             }
 
-            if (!$error) {
+            if (empty($error)) {
                 $users[] = [
                     'username' => $username,
                     'password' => password_hash($password, PASSWORD_DEFAULT),
+                    'telefono' => $telefono,
                     'created_at' => date('Y-m-d H:i:s')
                 ];
 
-                if (file_put_contents($users_file, json_encode($users, JSON_PRETTY_PRINT))) {
-                    $success = "Registrado correctamente. Inicia sesión.";
+                if (safe_json_write($users_file, $users)) {
+                    $_SESSION['register_success'] = "Registrado correctamente. Inicia sesión.";
+                    header("Location: ".$_SERVER['PHP_SELF']);
+                    exit;
                 } else {
-                    $error = "Error al guardar el usuario.";
+                    $error = "Error al guardar el usuario. Inténtalo de nuevo.";
                 }
             }
         }
     }
+}
+
+// Mostrar mensaje de éxito de registro si existe
+if (isset($_SESSION['register_success'])) {
+    $success = $_SESSION['register_success'];
+    unset($_SESSION['register_success']);
 }
 
 // Inicio de sesión
@@ -111,30 +214,39 @@ if (isset($_POST['login'])) {
         $username = sanitizeInput($_POST['username']);
         $password = $_POST['password'];
 
-        $users = json_decode(file_get_contents($users_file), true);
-        $user_found = false;
+        $users = safe_json_read($users_file);
+        $user_found = null;
 
         foreach ($users as $user) {
-            if ($user['username'] === $username && password_verify($password, $user['password'])) {
-                $_SESSION['username'] = $user['username'];
-                $_SESSION['last_login'] = time();
-                session_regenerate_id(true);
-                header("Location: index.php");
-                exit;
-            } elseif ($user['username'] === $username) {
-                $user_found = true;
+            if ($user['username'] === $username) {
+                $user_found = $user;
+                break;
             }
         }
 
-        $error = $user_found ? "Contraseña incorrecta." : "Usuario no encontrado.";
+        if ($user_found && password_verify($password, $user_found['password'])) {
+            $_SESSION['username'] = $user_found['username'];
+            $_SESSION['last_login'] = time();
+            session_regenerate_id(true);
+            header("Location: index.php");
+            exit;
+        } else {
+            $error = $user_found ? "Contraseña incorrecta." : "Usuario no encontrado.";
+        }
     }
 }
 
 // Cierre de sesión
 if (isset($_GET['logout'])) {
     $_SESSION = [];
+    if (ini_get("session.use_cookies")) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000,
+            $params["path"], $params["domain"],
+            $params["secure"], $params["httponly"]
+        );
+    }
     session_destroy();
-    setcookie(session_name(), '', time() - 3600, '/');
     header("Location: index.php");
     exit;
 }
@@ -146,13 +258,13 @@ if (isset($_POST['guardar_control']) && isset($_SESSION['username'])) {
     } else {
         $lat = $_POST['lat'];
         $lng = $_POST['lng'];
-        $tipo = isset($_POST['tipo']) ? $_POST['tipo'] : 'otros';
+        $tipo = $_POST['tipo'] ?? 'otros';
         $descripcion = sanitizeInput($_POST['descripcion'] ?? 'Control reportado');
 
         if (!validateLatLng($lat, $lng)) {
             $error = "Coordenadas inválidas.";
         } else {
-            $controles = json_decode(file_get_contents($controles_file), true);
+            $controles = safe_json_read($controles_file);
 
             $controles[] = [
                 'lat' => (float)$lat,
@@ -165,7 +277,7 @@ if (isset($_POST['guardar_control']) && isset($_SESSION['username'])) {
                 'puntuacion' => 0
             ];
 
-            if (file_put_contents($controles_file, json_encode($controles, JSON_PRETTY_PRINT))) {
+            if (safe_json_write($controles_file, $controles)) {
                 $success = "Control guardado correctamente.";
             } else {
                 $error = "Error al guardar el control.";
@@ -185,11 +297,9 @@ if (isset($_POST['guardar_camuflado']) && isset($_SESSION['username'])) {
         $descripcion = sanitizeInput($_POST['descripcion']);
         $foto = '';
 
-        // Validación de campos obligatorios
         if (empty($matricula) || empty($marca) || empty($modelo)) {
             $error = "Matrícula, marca y modelo son obligatorios.";
         } else {
-            // Procesamiento de la imagen
             if (isset($_FILES['foto']) && $_FILES['foto']['error'] === UPLOAD_ERR_OK) {
                 $file_name = $_FILES['foto']['name'];
                 $file_tmp = $_FILES['foto']['tmp_name'];
@@ -211,8 +321,8 @@ if (isset($_POST['guardar_camuflado']) && isset($_SESSION['username'])) {
                 }
             }
 
-            if (!$error) {
-                $camuflados = json_decode(file_get_contents($camuflados_file), true);
+            if (empty($error)) {
+                $camuflados = safe_json_read($camuflados_file);
 
                 $camuflados[] = [
                     'matricula' => $matricula,
@@ -224,7 +334,7 @@ if (isset($_POST['guardar_camuflado']) && isset($_SESSION['username'])) {
                     'fecha' => date('Y-m-d H:i:s')
                 ];
 
-                if (file_put_contents($camuflados_file, json_encode($camuflados, JSON_PRETTY_PRINT))) {
+                if (safe_json_write($camuflados_file, $camuflados)) {
                     $success = "Vehículo camuflado guardado correctamente.";
                 } else {
                     $error = "Error al guardar el vehículo.";
@@ -242,23 +352,20 @@ if (isset($_POST['votar']) && isset($_SESSION['username'])) {
         $control_id = (int)$_POST['control_id'];
         $voto = (int)$_POST['voto'];
 
-        $controles = json_decode(file_get_contents($controles_file), true);
+        $controles = safe_json_read($controles_file);
 
         if (isset($controles[$control_id])) {
-            // Inicializar votos si no existen
             if (!isset($controles[$control_id]['votos'])) {
                 $controles[$control_id]['votos'] = [];
             }
 
-            // Registrar voto (solo uno por usuario)
             $controles[$control_id]['votos'][$_SESSION['username']] = $voto;
 
-            // Calcular puntuación promedio
             $total_votos = count($controles[$control_id]['votos']);
             $suma_votos = array_sum($controles[$control_id]['votos']);
             $controles[$control_id]['puntuacion'] = $total_votos > 0 ? $suma_votos / $total_votos : 0;
 
-            if (file_put_contents($controles_file, json_encode($controles, JSON_PRETTY_PRINT))) {
+            if (safe_json_write($controles_file, $controles)) {
                 $success = "Voto registrado correctamente.";
             } else {
                 $error = "Error al guardar el voto.";
@@ -268,10 +375,10 @@ if (isset($_POST['votar']) && isset($_SESSION['username'])) {
 }
 
 // Cargar datos para mostrar
-$controles = json_decode(file_get_contents($controles_file), true) ?: [];
-$camuflados = json_decode(file_get_contents($camuflados_file), true) ?: [];
+$controles = safe_json_read($controles_file);
+$camuflados = safe_json_read($camuflados_file);
 
-// Generar token CSRF para los formularios
+// Generar token CSRF
 $csrf_token = generateCSRFToken();
 ?>
 <!DOCTYPE html>
@@ -281,120 +388,35 @@ $csrf_token = generateCSRFToken();
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Radar VTC</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css">
     <style>
-        body {
-            background: #f8f9fa;
-            font-family: 'Segoe UI', sans-serif;
-        }
-        .container {
-            margin-top: 30px;
-        }
-        #map {
-            height: 600px;
-            margin-bottom: 20px;
-            border: 2px solid #ddd;
-            border-radius: 5px;
-        }
-        .big-button {
-            font-size: 1.5rem;
-            padding: 15px 25px;
-            background-color: #dc3545;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            display: block;
-            width: 100%;
-            margin-bottom: 20px;
-        }
-        .card {
-            margin-bottom: 20px;
-        }
-        footer {
-            margin-top: 40px;
-            padding: 20px;
-            text-align: center;
-            font-size: 0.9rem;
-            color: #999;
-        }
-        img.preview {
-            max-width: 200px;
-            max-height: 200px;
-            margin-top: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
+        body { background: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
+        .container { margin-top: 30px; }
+        #map { height: 600px; margin-bottom: 20px; border: 2px solid #ddd; border-radius: 5px; }
+        .big-button { font-size: 1.5rem; padding: 15px 25px; background-color: #dc3545; color: white;
+                     border: none; border-radius: 8px; display: block; width: 100%; margin-bottom: 20px; }
+        .card { margin-bottom: 20px; }
+        footer { margin-top: 40px; padding: 20px; text-align: center; font-size: 0.9rem; color: #999; }
+        img.preview { max-width: 200px; max-height: 200px; margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
         .error { color: #dc3545; }
         .success { color: #28a745; }
-        .heatmap-layer {
-            opacity: 0.7;
-        }
-        .voting-buttons {
-            margin-top: 10px;
-        }
-        .voting-buttons button {
-            margin-right: 5px;
-        }
-        .control-details {
-            margin-top: 10px;
-            font-size: 0.9em;
-        }
-        .control-type {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 0.8em;
-            font-weight: bold;
-            margin-right: 5px;
-        }
-        .gm-style .gm-style-iw-c {
-            padding: 12px !important;
-            max-width: 300px !important;
-        }
-        .gm-style .gm-style-iw-d {
-            overflow: auto !important;
-        }
-        /* Estilos para el modal de añadir control */
-        #addControlModal .modal-dialog {
-            max-width: 500px;
-        }
-        #addControlModal .map-container {
-            height: 250px;
-            margin-bottom: 15px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-        }
-        #miniMap {
-            height: 100%;
-            width: 100%;
-        }
-        .address-display {
-            background-color: #f8f9fa;
-            padding: 10px;
-            border-radius: 4px;
-            margin-bottom: 15px;
-        }
-        .address-line {
-            margin-bottom: 5px;
-        }
-        #addressSearch {
-            margin-bottom: 10px;
-        }
-        #searchResults {
-            max-height: 150px;
-            overflow-y: auto;
-            margin-bottom: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            display: none;
-        }
-        .search-result-item {
-            padding: 8px;
-            cursor: pointer;
-            border-bottom: 1px solid #eee;
-        }
-        .search-result-item:hover {
-            background-color: #f0f0f0;
-        }
+        .heatmap-layer { opacity: 0.7; }
+        .voting-buttons { margin-top: 10px; }
+        .voting-buttons button { margin-right: 5px; }
+        .control-details { margin-top: 10px; font-size: 0.9em; }
+        .control-type { display: inline-block; padding: 2px 6px; border-radius: 3px;
+                       font-size: 0.8em; font-weight: bold; margin-right: 5px; }
+        .gm-style .gm-style-iw-c { padding: 12px !important; max-width: 300px !important; }
+        .gm-style .gm-style-iw-d { overflow: auto !important; }
+        #addControlModal .modal-dialog { max-width: 500px; }
+        #addControlModal .map-container { height: 250px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        #miniMap { height: 100%; width: 100%; }
+        .address-display { background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
+        .address-line { margin-bottom: 5px; }
+        #addressSearch { margin-bottom: 10px; }
+        #searchResults { max-height: 150px; overflow-y: auto; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; display: none; }
+        .search-result-item { padding: 8px; cursor: pointer; border-bottom: 1px solid #eee; }
+        .search-result-item:hover { background-color: #f0f0f0; }
     </style>
 </head>
 <body>
@@ -402,10 +424,10 @@ $csrf_token = generateCSRFToken();
     <h1 class="text-center mb-4">Radar VTC</h1>
 
     <?php if (!isset($_SESSION['username'])): ?>
-        <?php if ($error): ?>
+        <?php if (!empty($error)): ?>
             <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
         <?php endif; ?>
-        <?php if ($success): ?>
+        <?php if (!empty($success)): ?>
             <div class="alert alert-success"><?= htmlspecialchars($success) ?></div>
         <?php endif; ?>
 
@@ -423,6 +445,10 @@ $csrf_token = generateCSRFToken();
                             <div class="mb-3">
                                 <label for="reg-password" class="form-label">Contraseña</label>
                                 <input type="password" id="reg-password" name="password" class="form-control" required minlength="8">
+                            </div>
+                            <div class="mb-3">
+                                <label for="telefono" class="form-label">Teléfono (opcional)</label>
+                                <input type="tel" id="telefono" name="telefono" class="form-control" placeholder="+525511223344">
                             </div>
                             <button type="submit" name="register" class="btn btn-primary w-100">Registrarse</button>
                         </form>
@@ -648,19 +674,12 @@ $csrf_token = generateCSRFToken();
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
 <script src="https://maps.googleapis.com/maps/api/js?key=<?= $google_maps_api_key ?>&libraries=places,visualization&callback=initMap" async defer></script>
 
 <script>
     // Variables globales
-    let map;
-    let heatmap;
-    let userMarker;
-    let controlsMarkers = [];
-    let addControlMarker = null;
-    let miniMap = null;
-    let geocoder;
-    let placesService;
-    let autocomplete;
+    let map, heatmap, userMarker, controlsMarkers = [], addControlMarker, miniMap, geocoder, placesService, autocomplete;
     const controlTypes = {
         'radar': {color: '#FF0000', name: 'Radar'},
         'policia': {color: '#0000FF', name: 'Control policial'},
@@ -670,30 +689,23 @@ $csrf_token = generateCSRFToken();
 
     // Función para inicializar el mapa
     function initMap() {
-        // Centro inicial (se actualizará con la ubicación del usuario)
         const initialPos = {lat: 40.4168, lng: -3.7038};
 
-        // Crear mapa principal
         map = new google.maps.Map(document.getElementById('map'), {
             center: initialPos,
             zoom: 14,
             streetViewControl: false,
-            mapTypeControlOptions: {
-                mapTypeIds: ['roadmap', 'hybrid']
-            }
+            mapTypeControlOptions: {mapTypeIds: ['roadmap', 'hybrid']}
         });
 
-        // Inicializar servicios
         geocoder = new google.maps.Geocoder();
         placesService = new google.maps.places.PlacesService(map);
 
-        // Escuchar clicks en el mapa
         map.addListener('click', (event) => {
             openAddControlModal(event.latLng);
             updateAddressFromLatLng(event.latLng);
         });
 
-        // Obtener ubicación del usuario
         if (navigator.geolocation) {
             navigator.geolocation.getCurrentPosition(
                 position => {
@@ -702,10 +714,8 @@ $csrf_token = generateCSRFToken();
                         lng: position.coords.longitude
                     };
 
-                    // Centrar mapa en la ubicación del usuario
                     map.setCenter(userPos);
 
-                    // Añadir marcador de usuario
                     userMarker = new google.maps.Marker({
                         position: userPos,
                         map: map,
@@ -720,12 +730,10 @@ $csrf_token = generateCSRFToken();
                         }
                     });
 
-                    // Cargar controles
                     loadControls();
                 },
                 error => {
                     console.error("Error al obtener ubicación:", error);
-                    // Cargar controles igualmente
                     loadControls();
                 },
                 {enableHighAccuracy: true, timeout: 5000}
@@ -741,17 +749,14 @@ $csrf_token = generateCSRFToken();
         const controles = <?= json_encode($controles, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
         const heatmapData = [];
 
-        // Limpiar marcadores anteriores
         controlsMarkers.forEach(marker => marker.setMap(null));
         controlsMarkers = [];
 
-        // Procesar cada control
         controles.forEach((control, index) => {
             const controlType = control.tipo || 'otros';
             const typeInfo = controlTypes[controlType] || controlTypes['otros'];
             const position = {lat: parseFloat(control.lat), lng: parseFloat(control.lng)};
 
-            // Crear marcador
             const marker = new google.maps.Marker({
                 position: position,
                 map: map,
@@ -766,7 +771,6 @@ $csrf_token = generateCSRFToken();
                 }
             });
 
-            // Obtener dirección para el control
             getAddressForControl(position, (address) => {
                 const infoWindow = new google.maps.InfoWindow({
                     content: createControlInfoContent(control, index, typeInfo, address)
@@ -778,15 +782,12 @@ $csrf_token = generateCSRFToken();
             });
 
             controlsMarkers.push(marker);
-
-            // Añadir punto para el mapa de calor
             heatmapData.push({
                 location: new google.maps.LatLng(control.lat, control.lng),
                 weight: (control.puntuacion || 0) + 1
             });
         });
 
-        // Crear o actualizar mapa de calor
         if (heatmap) {
             heatmap.setData(heatmapData);
         } else {
@@ -810,34 +811,23 @@ $csrf_token = generateCSRFToken();
     function getAddressForControl(position, callback) {
         geocoder.geocode({location: position}, (results, status) => {
             if (status === 'OK' && results[0]) {
-                let street = '';
-                let number = '';
-                let city = '';
+                let street = '', number = '', city = '';
 
-                // Analizar componentes de la dirección
                 for (const component of results[0].address_components) {
                     const componentType = component.types[0];
 
                     switch (componentType) {
-                        case 'route':
-                            street = component.long_name;
-                            break;
-                        case 'street_number':
-                            number = component.long_name;
-                            break;
-                        case 'locality':
-                            city = component.long_name;
-                            break;
+                        case 'route': street = component.long_name; break;
+                        case 'street_number': number = component.long_name; break;
+                        case 'locality': city = component.long_name; break;
                     }
                 }
 
-                const address = {
+                callback({
                     street: street || 'Calle no especificada',
                     number: number || 'S/N',
                     city: city || 'Ciudad no especificada'
-                };
-
-                callback(address);
+                });
             } else {
                 callback({
                     street: 'Dirección no disponible',
@@ -883,11 +873,9 @@ $csrf_token = generateCSRFToken();
 
     // Función para abrir el modal de añadir control
     function openAddControlModal(latLng) {
-        // Mostrar modal
         const modal = new bootstrap.Modal(document.getElementById('addControlModal'));
         modal.show();
 
-        // Inicializar mini mapa si no está inicializado
         if (!miniMap) {
             miniMap = new google.maps.Map(document.getElementById('miniMap'), {
                 center: latLng,
@@ -895,7 +883,6 @@ $csrf_token = generateCSRFToken();
                 disableDefaultUI: true
             });
 
-            // Añadir marcador en el mini mapa
             addControlMarker = new google.maps.Marker({
                 position: latLng,
                 map: miniMap,
@@ -903,20 +890,16 @@ $csrf_token = generateCSRFToken();
                 title: 'Ubicación del control'
             });
 
-            // Actualizar dirección al arrastrar el marcador
             addControlMarker.addListener('dragend', function(event) {
                 updateAddressFromLatLng(event.latLng);
             });
 
-            // Configurar autocompletado de direcciones
             initAutocomplete();
         } else {
-            // Centrar y actualizar marcador
             miniMap.setCenter(latLng);
             addControlMarker.setPosition(latLng);
         }
 
-        // Actualizar campos ocultos con las coordenadas
         document.getElementById('modalLatInput').value = latLng.lat();
         document.getElementById('modalLngInput').value = latLng.lng();
     }
@@ -936,47 +919,29 @@ $csrf_token = generateCSRFToken();
                 return;
             }
 
-            // Centrar el mapa y actualizar el marcador
             miniMap.setCenter(place.geometry.location);
             addControlMarker.setPosition(place.geometry.location);
-
-            // Actualizar campos ocultos
             document.getElementById('modalLatInput').value = place.geometry.location.lat();
             document.getElementById('modalLngInput').value = place.geometry.location.lng();
-
-            // Actualizar dirección
             updateAddressFromPlace(place);
         });
     }
 
     // Función para actualizar la dirección desde un lugar
     function updateAddressFromPlace(place) {
-        let street = '';
-        let number = '';
-        let city = '';
-        let postalCode = '';
+        let street = '', number = '', city = '', postalCode = '';
 
-        // Analizar componentes de la dirección
         for (const component of place.address_components) {
             const componentType = component.types[0];
 
             switch (componentType) {
-                case 'route':
-                    street = component.long_name;
-                    break;
-                case 'street_number':
-                    number = component.long_name;
-                    break;
-                case 'locality':
-                    city = component.long_name;
-                    break;
-                case 'postal_code':
-                    postalCode = component.long_name;
-                    break;
+                case 'route': street = component.long_name; break;
+                case 'street_number': number = component.long_name; break;
+                case 'locality': city = component.long_name; break;
+                case 'postal_code': postalCode = component.long_name; break;
             }
         }
 
-        // Actualizar la visualización
         document.getElementById('address-street').textContent = street || 'No especificada';
         document.getElementById('address-number').textContent = number || 'S/N';
         document.getElementById('address-city').textContent = city || 'No especificada';
@@ -1030,6 +995,29 @@ $csrf_token = generateCSRFToken();
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#039;");
     }
+
+    // Mostrar notificaciones
+    <?php if ($success): ?>
+        Toastify({
+            text: "<?= addslashes($success) ?>",
+            duration: 3000,
+            close: true,
+            gravity: "top",
+            position: "right",
+            backgroundColor: "#28a745",
+        }).showToast();
+    <?php endif; ?>
+
+    <?php if ($error): ?>
+        Toastify({
+            text: "<?= addslashes($error) ?>",
+            duration: 3000,
+            close: true,
+            gravity: "top",
+            position: "right",
+            backgroundColor: "#dc3545",
+        }).showToast();
+    <?php endif; ?>
 </script>
 </body>
 </html>

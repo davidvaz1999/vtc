@@ -25,7 +25,7 @@ header("Referrer-Policy: strict-origin-when-cross-origin");
 $isSecure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || $_SERVER['SERVER_PORT'] == 443;
 
 if (!file_exists(__DIR__.'/sessions')) {
-    mkdir(__DIR__.'/sessions', 0755);
+    mkdir(__DIR__.'/sessions', 0755, true);
 }
 
 session_start([
@@ -43,7 +43,6 @@ session_start([
 $uploads_dir = "uploads/";
 $allowed_image_types = ['jpg', 'jpeg', 'png', 'gif'];
 $max_file_size = 5 * 1024 * 1024;
-$google_maps_api_key = "AIzaSyDt_rhgIYlQ1EtpUGUv6j0R3InUzmwD3EE";
 $data_dir = "data/";
 
 // Crear directorios con verificación
@@ -66,6 +65,7 @@ if (!file_exists($uploads_dir)) {
 $users_file = $data_dir . "users.json";
 $controles_file = $data_dir . "controles.json";
 $camuflados_file = $data_dir . "camuflados.json";
+$deleted_controls_file = $data_dir . "deleted_controls.json";
 
 // ======================================
 // FUNCIONES MEJORADAS PARA MANEJO DE JSON
@@ -85,7 +85,6 @@ function safe_json_read($file) {
 
     $data = @json_decode($content, true);
     if (json_last_error() !== JSON_ERROR_NONE) {
-        // Intenta reparar JSON corrupto
         $content = preg_replace('/[^\x20-\x7F]/', '', $content);
         $data = json_decode($content, true);
 
@@ -128,6 +127,22 @@ function safe_json_write($file, $data) {
 
     chmod($file, 0644);
     return true;
+}
+
+function filtrarControlesExpirados($controles) {
+    $now = new DateTime();
+    return array_filter($controles, function($control) use ($now) {
+        if (!isset($control['expira'])) {
+            return true;
+        }
+        try {
+            $expira = new DateTime($control['expira']);
+            return $expira > $now;
+        } catch (Exception $e) {
+            error_log("Error al parsear fecha de expiración: " . $e->getMessage());
+            return false;
+        }
+    });
 }
 
 function sanitizeInput($data) {
@@ -200,7 +215,6 @@ if (isset($_POST['register'])) {
     }
 }
 
-// Mostrar mensaje de éxito de registro si existe
 if (isset($_SESSION['register_success'])) {
     $success = $_SESSION['register_success'];
     unset($_SESSION['register_success']);
@@ -258,8 +272,9 @@ if (isset($_POST['guardar_control']) && isset($_SESSION['username'])) {
     } else {
         $lat = $_POST['lat'];
         $lng = $_POST['lng'];
-        $tipo = $_POST['tipo'] ?? 'otros';
-        $descripcion = sanitizeInput($_POST['descripcion'] ?? 'Control reportado');
+        $tipo = 'policia';
+        $descripcion = sanitizeInput($_POST['descripcion'] ?? 'Control Policial VTC');
+        $anonimo = isset($_POST['anonimo']);
 
         if (!validateLatLng($lat, $lng)) {
             $error = "Coordenadas inválidas.";
@@ -272,9 +287,13 @@ if (isset($_POST['guardar_control']) && isset($_SESSION['username'])) {
                 'tipo' => $tipo,
                 'descripcion' => $descripcion,
                 'usuario' => $_SESSION['username'],
+                'usuario_mostrado' => $anonimo ? 'Anónimo' : $_SESSION['username'],
+                'anonimo' => $anonimo,
                 'fecha' => date('Y-m-d H:i:s'),
+                'expira' => date('Y-m-d H:i:s', time() + 5 * 3600),
                 'votos' => [],
-                'puntuacion' => 0
+                'puntuacion' => 0,
+                'intensidad' => 1
             ];
 
             if (safe_json_write($controles_file, $controles)) {
@@ -359,11 +378,18 @@ if (isset($_POST['votar']) && isset($_SESSION['username'])) {
                 $controles[$control_id]['votos'] = [];
             }
 
-            $controles[$control_id]['votos'][$_SESSION['username']] = $voto;
+            $voto_actual = $controles[$control_id]['votos'][$_SESSION['username']] ?? 0;
+            $nuevo_voto = $voto_actual + $voto;
+
+            $nuevo_voto = max(-5, min(5, $nuevo_voto));
+
+            $controles[$control_id]['votos'][$_SESSION['username']] = $nuevo_voto;
 
             $total_votos = count($controles[$control_id]['votos']);
             $suma_votos = array_sum($controles[$control_id]['votos']);
-            $controles[$control_id]['puntuacion'] = $total_votos > 0 ? $suma_votos / $total_votos : 0;
+
+            $controles[$control_id]['puntuacion'] = $suma_votos;
+            $controles[$control_id]['intensidad'] = min(10, $total_votos);
 
             if (safe_json_write($controles_file, $controles)) {
                 $success = "Voto registrado correctamente.";
@@ -374,8 +400,43 @@ if (isset($_POST['votar']) && isset($_SESSION['username'])) {
     }
 }
 
+// Eliminar control (solo admin)
+if (isset($_POST['eliminar_control']) && isset($_SESSION['username']) && $_SESSION['username'] === 'admin') {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        $error = "Token CSRF inválido.";
+    } else {
+        $control_id = (int)$_POST['control_id'];
+        $controles = safe_json_read($controles_file);
+
+        if (isset($controles[$control_id])) {
+            // Guardar copia del control eliminado en un archivo de logs
+            $deleted_controls = safe_json_read($deleted_controls_file);
+            $deleted_controls[] = [
+                'control' => $controles[$control_id],
+                'deleted_by' => $_SESSION['username'],
+                'deleted_at' => date('Y-m-d H:i:s')
+            ];
+            safe_json_write($deleted_controls_file, $deleted_controls);
+
+            // Eliminar el control
+            unset($controles[$control_id]);
+            $controles = array_values($controles); // Reindexar array
+
+            if (safe_json_write($controles_file, $controles)) {
+                $success = "Control eliminado correctamente.";
+                header("Location: ".$_SERVER['PHP_SELF']);
+                exit;
+            } else {
+                $error = "Error al eliminar el control.";
+            }
+        } else {
+            $error = "Control no encontrado.";
+        }
+    }
+}
+
 // Cargar datos para mostrar
-$controles = safe_json_read($controles_file);
+$controles = filtrarControlesExpirados(safe_json_read($controles_file));
 $camuflados = safe_json_read($camuflados_file);
 
 // Generar token CSRF
@@ -389,12 +450,11 @@ $csrf_token = generateCSRFToken();
     <title>Radar VTC</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
         body { background: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
         .container { margin-top: 30px; }
         #map { height: 600px; margin-bottom: 20px; border: 2px solid #ddd; border-radius: 5px; }
-        .big-button { font-size: 1.5rem; padding: 15px 25px; background-color: #dc3545; color: white;
-                     border: none; border-radius: 8px; display: block; width: 100%; margin-bottom: 20px; }
         .card { margin-bottom: 20px; }
         footer { margin-top: 40px; padding: 20px; text-align: center; font-size: 0.9rem; color: #999; }
         img.preview { max-width: 200px; max-height: 200px; margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
@@ -405,9 +465,7 @@ $csrf_token = generateCSRFToken();
         .voting-buttons button { margin-right: 5px; }
         .control-details { margin-top: 10px; font-size: 0.9em; }
         .control-type { display: inline-block; padding: 2px 6px; border-radius: 3px;
-                       font-size: 0.8em; font-weight: bold; margin-right: 5px; }
-        .gm-style .gm-style-iw-c { padding: 12px !important; max-width: 300px !important; }
-        .gm-style .gm-style-iw-d { overflow: auto !important; }
+                       font-size: 0.8em; font-weight: bold; margin-right: 5px; background-color: #FF000020; color: #FF0000; }
         #addControlModal .modal-dialog { max-width: 500px; }
         #addControlModal .map-container { height: 250px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; }
         #miniMap { height: 100%; width: 100%; }
@@ -417,6 +475,101 @@ $csrf_token = generateCSRFToken();
         #searchResults { max-height: 150px; overflow-y: auto; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; display: none; }
         .search-result-item { padding: 8px; cursor: pointer; border-bottom: 1px solid #eee; }
         .search-result-item:hover { background-color: #f0f0f0; }
+        .badge.bg-secondary { font-size: 0.6em; vertical-align: middle; }
+
+        /* Estilos para Leaflet */
+        .leaflet-container { background: #fff; }
+        .leaflet-popup-content { min-width: 200px; }
+        .user-marker-inner {
+            width: 100%;
+            height: 100%;
+            background: #4285F4;
+            border: 2px solid white;
+            border-radius: 50%;
+            box-shadow: 0 0 5px rgba(0,0,0,0.3);
+        }
+        .control-marker div {
+            transition: all 0.3s ease;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 0 5px rgba(0,0,0,0.5);
+            background-color: #FF0000;
+        }
+
+        /* Mejoras para votación */
+        .voting-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 15px;
+        }
+        .voting-buttons button {
+            flex: 1;
+            min-width: 80px;
+            margin: 2px;
+        }
+        .control-details strong {
+            display: inline-block;
+            min-width: 120px;
+        }
+
+        /* Correcciones para el mini mapa */
+        #miniMap {
+            height: 250px;
+            width: 100%;
+            z-index: 0;
+        }
+        .leaflet-container {
+            background: #fff;
+            z-index: 0;
+        }
+
+        /* Estilo para el tiempo restante */
+        .time-remaining {
+            color: #6c757d;
+            font-size: 0.85em;
+            margin-top: 5px;
+        }
+
+        /* Botón de reporte */
+        .report-button {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 56px;
+            height: 56px;
+            background-color: #dc3545;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            z-index: 1000;
+            transition: all 0.3s ease;
+        }
+        .report-button:hover {
+            background-color: #c82333;
+            transform: scale(1.1);
+        }
+        .report-button svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        /* Botones de administración */
+        .admin-actions {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+        }
+        .admin-actions .btn {
+            padding: 0.25rem 0.5rem;
+            font-size: 0.8rem;
+        }
+        .admin-actions .btn svg {
+            margin-bottom: 2px;
+        }
     </style>
 </head>
 <body>
@@ -481,7 +634,14 @@ $csrf_token = generateCSRFToken();
             <a href="?logout">Cerrar sesión</a>
         </div>
 
-        <button onclick="reportarUbicacion()" class="big-button">REPORTAR CONTROL EN MI UBICACIÓN ACTUAL</button>
+        <!-- Botón flotante para reportar -->
+        <div id="reportButton" class="report-button" title="Reportar control en mi ubicación">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>
+        </div>
 
         <div id="map"></div>
 
@@ -515,18 +675,14 @@ $csrf_token = generateCSRFToken();
                             <input type="hidden" name="lng" id="modalLngInput">
                             <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
 
-                            <div class="mb-3">
-                                <label for="modalTipo" class="form-label">Tipo de control</label>
-                                <select id="modalTipo" name="tipo" class="form-control" required>
-                                    <option value="radar">Radar</option>
-                                    <option value="policia">Control policial</option>
-                                    <option value="dgt">Control DGT</option>
-                                    <option value="otros">Otro tipo</option>
-                                </select>
+                            <div class="mb-3 form-check">
+                                <input type="checkbox" class="form-check-input" id="anonimoCheck" name="anonimo" checked>
+                                <label class="form-check-label" for="anonimoCheck">Publicar como anónimo</label>
                             </div>
+
                             <div class="mb-3">
                                 <label for="modalDescripcion" class="form-label">Descripción (opcional)</label>
-                                <input type="text" id="modalDescripcion" name="descripcion" class="form-control">
+                                <input type="text" id="modalDescripcion" name="descripcion" class="form-control" value="Control Policial VTC">
                             </div>
                         </div>
                         <div class="modal-footer">
@@ -578,34 +734,58 @@ $csrf_token = generateCSRFToken();
                         <div class="card h-100">
                             <div class="card-body">
                                 <h5 class="card-title">Control #<?= $index + 1 ?></h5>
-                                <div class="control-type" style="background-color: <?=
-                                    $c['tipo'] === 'radar' ? '#FF000020' :
-                                    ($c['tipo'] === 'policia' ? '#0000FF20' :
-                                    ($c['tipo'] === 'dgt' ? '#FFA50020' : '#80808020')) ?>;
-                                    color: <?=
-                                    $c['tipo'] === 'radar' ? '#FF0000' :
-                                    ($c['tipo'] === 'policia' ? '#0000FF' :
-                                    ($c['tipo'] === 'dgt' ? '#FFA500' : '#808080')) ?>">
-                                    <?=
-                                    $c['tipo'] === 'radar' ? 'Radar' :
-                                    ($c['tipo'] === 'policia' ? 'Control policial' :
-                                    ($c['tipo'] === 'dgt' ? 'Control DGT' : 'Otro control')) ?>
+                                <?php if ($_SESSION['username'] === 'admin'): ?>
+                                    <div class="admin-actions">
+                                        <form method="POST" onsubmit="return confirm('¿Estás seguro de eliminar este control?');">
+                                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                            <input type="hidden" name="control_id" value="<?= $index ?>">
+                                            <button type="submit" name="eliminar_control" class="btn btn-sm btn-danger">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                                                </svg>
+                                                Eliminar
+                                            </button>
+                                        </form>
+                                    </div>
+                                <?php endif; ?>
+                                <div class="control-type">
+                                    Control Policial VTC
                                 </div>
                                 <p class="card-text"><?= htmlspecialchars($c['descripcion']) ?></p>
                                 <div class="control-details">
-                                    <strong>Reportado por:</strong> <?= htmlspecialchars($c['usuario']) ?><br>
+                                    <strong>Reportado por:</strong>
+                                    <?php
+                                        if ($_SESSION['username'] === 'admin') {
+                                            echo htmlspecialchars($c['usuario']);
+                                            if ($c['anonimo']) echo ' <span class="badge bg-secondary">Anónimo</span>';
+                                        } else {
+                                            echo htmlspecialchars($c['usuario_mostrado']);
+                                        }
+                                    ?><br>
                                     <strong>Fecha:</strong> <?= htmlspecialchars($c['fecha']) ?><br>
-                                    <strong>Puntuación:</strong> <?= number_format($c['puntuacion'] ?? 0, 1) ?>
-                                    (<?= count($c['votos'] ?? []) ?> votos)
+                                    <strong>Votos:</strong> <?= count($c['votos'] ?? []) ?>
                                 </div>
+                                <?php if (isset($c['expira'])): ?>
+                                    <?php
+                                        $now = new DateTime();
+                                        $expira = new DateTime($c['expira']);
+                                        $diff = $expira->diff($now);
+                                    ?>
+                                    <div class="time-remaining">
+                                        <strong>Tiempo restante:</strong>
+                                        <?= $diff->h ?> horas, <?= $diff->i ?> minutos, <?= $diff->s ?> segundos
+                                    </div>
+                                <?php endif; ?>
                                 <?php if (isset($_SESSION['username'])): ?>
                                 <div class="voting-buttons mt-3">
                                     <form method="POST" class="d-inline">
                                         <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                         <input type="hidden" name="control_id" value="<?= $index ?>">
-                                        <button type="submit" name="votar" value="1" class="btn btn-sm btn-success">👍</button>
-                                        <button type="submit" name="votar" value="0" class="btn btn-sm btn-secondary">➖</button>
-                                        <button type="submit" name="votar" value="-1" class="btn btn-sm btn-danger">👎</button>
+                                        <button type="submit" name="votar" value="1" class="btn btn-sm btn-success">👍 +1</button>
+                                        <button type="submit" name="votar" value="-1" class="btn btn-sm btn-danger">👎 -1</button>
+                                        <button type="submit" name="votar" value="2" class="btn btn-sm btn-success" style="font-weight:bold;">👍👍 +2</button>
+                                        <button type="submit" name="votar" value="-2" class="btn btn-sm btn-danger" style="font-weight:bold;">👎👎 -2</button>
                                     </form>
                                 </div>
                                 <?php endif; ?>
@@ -661,10 +841,11 @@ $csrf_token = generateCSRFToken();
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <p>Aplicación para reportar controles de tráfico y vehículos camuflados.</p>
+                <p>Aplicación para reportar controles policiales VTC.</p>
                 <p><strong>Versión:</strong> 2.0</p>
                 <p><strong>Desarrollado por:</strong> TuNombre</p>
-                <p>Esta aplicación utiliza Google Maps API para mostrar la ubicación de los controles.</p>
+                <p>Esta aplicación utiliza OpenStreetMap para mostrar la ubicación de los controles.</p>
+                <p>Los controles automáticamente expiran después de 5 horas.</p>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
@@ -675,72 +856,75 @@ $csrf_token = generateCSRFToken();
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
-<script src="https://maps.googleapis.com/maps/api/js?key=<?= $google_maps_api_key ?>&libraries=places,visualization&callback=initMap" async defer></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 
 <script>
     // Variables globales
-    let map, heatmap, userMarker, controlsMarkers = [], addControlMarker, miniMap, geocoder, placesService, autocomplete;
+    let map, heatmap, userMarker, controlsLayer = null, addControlMarker, miniMap, geocoder;
+    const esAdmin = <?= isset($_SESSION['username']) && $_SESSION['username'] === 'admin' ? 'true' : 'false' ?>;
     const controlTypes = {
-        'radar': {color: '#FF0000', name: 'Radar'},
-        'policia': {color: '#0000FF', name: 'Control policial'},
-        'dgt': {color: '#FFA500', name: 'Control DGT'},
-        'otros': {color: '#808080', name: 'Otro control'}
+        'policia': {color: '#FF0000', name: 'Control Policial VTC'}
     };
 
     // Función para inicializar el mapa
     function initMap() {
-        const initialPos = {lat: 40.4168, lng: -3.7038};
+        // Configuración inicial del mapa
+        const initialPos = [40.4168, -3.7038]; // Madrid como posición inicial
 
-        map = new google.maps.Map(document.getElementById('map'), {
-            center: initialPos,
-            zoom: 14,
-            streetViewControl: false,
-            mapTypeControlOptions: {mapTypeIds: ['roadmap', 'hybrid']}
+        map = L.map('map').setView(initialPos, 14);
+
+        // Añadir capa base de OpenStreetMap
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        // Inicializar geocoder (Nominatim)
+        geocoder = {
+            geocode: function(query, callback) {
+                fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`)
+                    .then(response => response.json())
+                    .then(data => callback(data))
+                    .catch(error => console.error('Error en geocoding:', error));
+            },
+            reverse: function(lat, lng, callback) {
+                fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`)
+                    .then(response => response.json())
+                    .then(data => callback(data))
+                    .catch(error => console.error('Error en reverse geocoding:', error));
+            }
+        };
+
+        // Cargar controles
+        loadControls();
+
+        // Manejar clics en el mapa
+        map.on('click', function(e) {
+            openAddControlModal(e.latlng);
+            updateAddressFromLatLng(e.latlng);
         });
 
-        geocoder = new google.maps.Geocoder();
-        placesService = new google.maps.places.PlacesService(map);
-
-        map.addListener('click', (event) => {
-            openAddControlModal(event.latLng);
-            updateAddressFromLatLng(event.latLng);
-        });
-
+        // Obtener ubicación del usuario
         if (navigator.geolocation) {
             navigator.geolocation.getCurrentPosition(
                 position => {
-                    const userPos = {
-                        lat: position.coords.latitude,
-                        lng: position.coords.longitude
-                    };
+                    const userPos = [position.coords.latitude, position.coords.longitude];
+                    map.setView(userPos, 16);
 
-                    map.setCenter(userPos);
-
-                    userMarker = new google.maps.Marker({
-                        position: userPos,
-                        map: map,
-                        title: 'Tu ubicación',
-                        icon: {
-                            path: google.maps.SymbolPath.CIRCLE,
-                            scale: 8,
-                            fillColor: '#4285F4',
-                            fillOpacity: 1,
-                            strokeWeight: 2,
-                            strokeColor: '#FFFFFF'
-                        }
-                    });
-
-                    loadControls();
+                    userMarker = L.marker(userPos, {
+                        icon: L.divIcon({
+                            className: 'user-marker',
+                            html: '<div class="user-marker-inner"></div>',
+                            iconSize: [20, 20]
+                        }),
+                        title: 'Tu ubicación'
+                    }).addTo(map);
                 },
                 error => {
                     console.error("Error al obtener ubicación:", error);
-                    loadControls();
-                },
-                {enableHighAccuracy: true, timeout: 5000}
+                }
             );
-        } else {
-            alert("Tu navegador no soporta geolocalización.");
-            loadControls();
         }
     }
 
@@ -749,121 +933,152 @@ $csrf_token = generateCSRFToken();
         const controles = <?= json_encode($controles, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
         const heatmapData = [];
 
-        controlsMarkers.forEach(marker => marker.setMap(null));
-        controlsMarkers = [];
+        // Eliminar marcadores existentes
+        if (controlsLayer) {
+            map.removeLayer(controlsLayer);
+        }
+
+        controlsLayer = L.layerGroup().addTo(map);
+
+        // Encontrar el máximo de votos para normalizar
+        const maxVotos = Math.max(1, ...controles.map(c => Math.abs(c.puntuacion) || 0));
 
         controles.forEach((control, index) => {
-            const controlType = control.tipo || 'otros';
-            const typeInfo = controlTypes[controlType] || controlTypes['otros'];
-            const position = {lat: parseFloat(control.lat), lng: parseFloat(control.lng)};
+            const position = [parseFloat(control.lat), parseFloat(control.lng)];
 
-            const marker = new google.maps.Marker({
-                position: position,
-                map: map,
-                title: control.descripcion,
-                icon: {
-                    path: google.maps.SymbolPath.CIRCLE,
-                    scale: 8,
-                    fillColor: typeInfo.color,
-                    fillOpacity: 1,
-                    strokeWeight: 2,
-                    strokeColor: '#FFFFFF'
-                }
-            });
+            // Calcular tamaño del marcador basado en votos
+            const voteSize = 8 + (Math.min(10, Math.abs(control.puntuacion)) * 2);
+
+            const marker = L.marker(position, {
+                icon: L.divIcon({
+                    className: 'control-marker policia',
+                    html: `<div style="background-color: #FF0000; width: ${voteSize}px; height: ${voteSize}px;"></div>`,
+                    iconSize: [voteSize, voteSize]
+                })
+            }).addTo(controlsLayer);
 
             getAddressForControl(position, (address) => {
-                const infoWindow = new google.maps.InfoWindow({
-                    content: createControlInfoContent(control, index, typeInfo, address)
-                });
-
-                marker.addListener('click', () => {
-                    infoWindow.open(map, marker);
-                });
+                marker.bindPopup(createControlInfoContent(control, index, address));
             });
 
-            controlsMarkers.push(marker);
-            heatmapData.push({
-                location: new google.maps.LatLng(control.lat, control.lng),
-                weight: (control.puntuacion || 0) + 1
-            });
+            // Calcular peso para el heatmap basado en intensidad
+            const peso = 0.5 + (control.intensidad || 1) * 0.5;
+            heatmapData.push([position[0], position[1], peso]);
         });
 
         if (heatmap) {
-            heatmap.setData(heatmapData);
-        } else {
-            heatmap = new google.maps.visualization.HeatmapLayer({
-                data: heatmapData,
-                map: map,
-                radius: 30,
-                opacity: 0.7,
-                gradient: [
-                    'rgba(0, 255, 0, 0)',
-                    'rgba(0, 255, 0, 1)',
-                    'rgba(255, 255, 0, 1)',
-                    'rgba(255, 165, 0, 1)',
-                    'rgba(255, 0, 0, 1)'
-                ]
-            });
+            map.removeLayer(heatmap);
+        }
+
+        if (heatmapData.length > 0) {
+            heatmap = L.heatLayer(heatmapData, {
+                radius: 25,
+                blur: 20,
+                maxZoom: 17,
+                minOpacity: 0.5,
+                gradient: {
+                    0.1: 'blue',
+                    0.3: 'cyan',
+                    0.5: 'lime',
+                    0.7: 'yellow',
+                    0.9: 'red'
+                }
+            }).addTo(map);
         }
     }
 
     // Función para obtener dirección de un control
     function getAddressForControl(position, callback) {
-        geocoder.geocode({location: position}, (results, status) => {
-            if (status === 'OK' && results[0]) {
-                let street = '', number = '', city = '';
-
-                for (const component of results[0].address_components) {
-                    const componentType = component.types[0];
-
-                    switch (componentType) {
-                        case 'route': street = component.long_name; break;
-                        case 'street_number': number = component.long_name; break;
-                        case 'locality': city = component.long_name; break;
-                    }
-                }
-
+        geocoder.reverse(position[0], position[1], (data) => {
+            if (data) {
+                const address = data.address || {};
                 callback({
-                    street: street || 'Calle no especificada',
-                    number: number || 'S/N',
-                    city: city || 'Ciudad no especificada'
+                    street: address.road || 'Calle no especificada',
+                    number: address.house_number || 'S/N',
+                    city: address.city || address.town || address.village || 'Ciudad no especificada',
+                    postal: address.postcode || 'No especificado'
                 });
             } else {
                 callback({
                     street: 'Dirección no disponible',
                     number: '',
-                    city: ''
+                    city: '',
+                    postal: ''
                 });
             }
         });
     }
 
     // Función para crear el contenido de la ventana de información
-    function createControlInfoContent(control, index, typeInfo, address) {
-        const rating = control.puntuacion ? control.puntuacion.toFixed(1) : 'Sin votos';
+    function createControlInfoContent(control, index, address) {
         const totalVotes = control.votos ? Object.keys(control.votos).length : 0;
+        const sumaVotos = control.puntuacion || 0;
+        const userVote = control.votos && control.votos['<?= isset($_SESSION['username']) ? $_SESSION['username'] : '' ?>'] || 0;
+        const usuarioMostrado = esAdmin ?
+            `${escapeHtml(control.usuario)}${control.anonimo ? ' <span class="badge bg-secondary">Anónimo</span>' : ''}` :
+            escapeHtml(control.usuario_mostrado);
+
+        // Calcular tiempo restante
+        let expiracionInfo = '';
+        if (control.expira) {
+            const ahora = new Date();
+            const expira = new Date(control.expira);
+            const diffMs = expira - ahora;
+
+            if (diffMs > 0) {
+                const diffHoras = Math.floor(diffMs / (1000 * 60 * 60));
+                const diffMinutos = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+                const diffSegundos = Math.floor((diffMs % (1000 * 60)) / 1000);
+
+                expiracionInfo = `<strong>Tiempo restante:</strong> ${diffHoras} horas, ${diffMinutos} minutos, ${diffSegundos} segundos<br>`;
+            } else {
+                expiracionInfo = `<strong>Expirará pronto</strong><br>`;
+            }
+        }
+
+        let adminActions = '';
+        if (esAdmin) {
+            adminActions = `
+                <div class="admin-actions mb-2">
+                    <form method="POST" onsubmit="return confirm('¿Estás seguro de eliminar este control?');">
+                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                        <input type="hidden" name="control_id" value="${index}">
+                        <button type="submit" name="eliminar_control" class="btn btn-sm btn-danger">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                            </svg>
+                            Eliminar
+                        </button>
+                    </form>
+                </div>
+            `;
+        }
 
         return `
             <div class="control-info">
-                <h5>${typeInfo.name}</h5>
-                <div class="control-type" style="background-color: ${typeInfo.color}20; color: ${typeInfo.color}">
-                    ${typeInfo.name}
+                ${adminActions}
+                <h5>Control Policial VTC</h5>
+                <div class="control-type" style="background-color: #FF000020; color: #FF0000">
+                    Control Policial VTC
                 </div>
                 <p>${escapeHtml(control.descripcion)}</p>
                 <div class="control-details">
                     <strong>Ubicación:</strong> ${address.street} ${address.number}, ${address.city}<br>
-                    <strong>Reportado por:</strong> ${escapeHtml(control.usuario)}<br>
+                    <strong>Reportado por:</strong> ${usuarioMostrado}<br>
                     <strong>Fecha:</strong> ${escapeHtml(control.fecha)}<br>
-                    <strong>Puntuación:</strong> ${rating} (${totalVotes} votos)
+                    <strong>Votos:</strong> ${totalVotes}
+                    ${expiracionInfo}
                 </div>
                 <?php if (isset($_SESSION['username'])): ?>
-                <div class="voting-buttons">
+                <div class="voting-buttons mt-3">
                     <form method="POST" style="display:inline;">
                         <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                         <input type="hidden" name="control_id" value="${index}">
-                        <button type="submit" name="votar" value="1" class="btn btn-sm btn-success">👍</button>
-                        <button type="submit" name="votar" value="0" class="btn btn-sm btn-secondary">➖</button>
-                        <button type="submit" name="votar" value="-1" class="btn btn-sm btn-danger">👎</button>
+                        <button type="submit" name="votar" value="1" class="btn btn-sm btn-success">👍 +1</button>
+                        <button type="submit" name="votar" value="-1" class="btn btn-sm btn-danger">👎 -1</button>
+                        <button type="submit" name="votar" value="2" class="btn btn-sm btn-success" style="font-weight:bold;">👍👍 +2</button>
+                        <button type="submit" name="votar" value="-2" class="btn btn-sm btn-danger" style="font-weight:bold;">👎👎 -2</button>
                     </form>
                 </div>
                 <?php endif; ?>
@@ -874,87 +1089,66 @@ $csrf_token = generateCSRFToken();
     // Función para abrir el modal de añadir control
     function openAddControlModal(latLng) {
         const modal = new bootstrap.Modal(document.getElementById('addControlModal'));
+
+        // Asegurarse de que el modal está completamente mostrado antes de inicializar el mapa
+        $('#addControlModal').on('shown.bs.modal', function() {
+            if (!miniMap) {
+                miniMap = L.map('miniMap', {
+                    center: [latLng.lat, latLng.lng],
+                    zoom: 17,
+                    zoomControl: false,
+                    attributionControl: false
+                }).setView([latLng.lat, latLng.lng], 17);
+
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19
+                }).addTo(miniMap);
+
+                addControlMarker = L.marker([latLng.lat, latLng.lng], {
+                    draggable: true
+                }).addTo(miniMap);
+
+                addControlMarker.on('dragend', function(e) {
+                    const newPos = e.target.getLatLng();
+                    document.getElementById('modalLatInput').value = newPos.lat;
+                    document.getElementById('modalLngInput').value = newPos.lng;
+                    updateAddressFromLatLng(newPos);
+                });
+
+                initAutocomplete();
+            } else {
+                miniMap.setView([latLng.lat, latLng.lng], 17);
+                addControlMarker.setLatLng([latLng.lat, latLng.lng]);
+            }
+
+            // Forzar el redibujado del mapa
+            setTimeout(() => {
+                miniMap.invalidateSize();
+            }, 10);
+        });
+
         modal.show();
-
-        if (!miniMap) {
-            miniMap = new google.maps.Map(document.getElementById('miniMap'), {
-                center: latLng,
-                zoom: 18,
-                disableDefaultUI: true
-            });
-
-            addControlMarker = new google.maps.Marker({
-                position: latLng,
-                map: miniMap,
-                draggable: true,
-                title: 'Ubicación del control'
-            });
-
-            addControlMarker.addListener('dragend', function(event) {
-                updateAddressFromLatLng(event.latLng);
-            });
-
-            initAutocomplete();
-        } else {
-            miniMap.setCenter(latLng);
-            addControlMarker.setPosition(latLng);
-        }
-
-        document.getElementById('modalLatInput').value = latLng.lat();
-        document.getElementById('modalLngInput').value = latLng.lng();
-    }
-
-    // Función para inicializar el autocompletado de direcciones
-    function initAutocomplete() {
-        const input = document.getElementById('addressSearch');
-        autocomplete = new google.maps.places.Autocomplete(input, {
-            types: ['address'],
-            componentRestrictions: {country: 'es'}
-        });
-
-        autocomplete.addListener('place_changed', () => {
-            const place = autocomplete.getPlace();
-            if (!place.geometry) {
-                alert("No se encontraron detalles para esta dirección");
-                return;
-            }
-
-            miniMap.setCenter(place.geometry.location);
-            addControlMarker.setPosition(place.geometry.location);
-            document.getElementById('modalLatInput').value = place.geometry.location.lat();
-            document.getElementById('modalLngInput').value = place.geometry.location.lng();
-            updateAddressFromPlace(place);
-        });
-    }
-
-    // Función para actualizar la dirección desde un lugar
-    function updateAddressFromPlace(place) {
-        let street = '', number = '', city = '', postalCode = '';
-
-        for (const component of place.address_components) {
-            const componentType = component.types[0];
-
-            switch (componentType) {
-                case 'route': street = component.long_name; break;
-                case 'street_number': number = component.long_name; break;
-                case 'locality': city = component.long_name; break;
-                case 'postal_code': postalCode = component.long_name; break;
-            }
-        }
-
-        document.getElementById('address-street').textContent = street || 'No especificada';
-        document.getElementById('address-number').textContent = number || 'S/N';
-        document.getElementById('address-city').textContent = city || 'No especificada';
-        document.getElementById('address-postal').textContent = postalCode || 'No especificado';
+        document.getElementById('modalLatInput').value = latLng.lat;
+        document.getElementById('modalLngInput').value = latLng.lng;
+        updateAddressFromLatLng(latLng);
     }
 
     // Función para actualizar la dirección desde coordenadas
     function updateAddressFromLatLng(latLng) {
-        geocoder.geocode({location: latLng}, (results, status) => {
-            if (status === 'OK' && results[0]) {
-                updateAddressFromPlace(results[0]);
+        geocoder.reverse(latLng.lat, latLng.lng, (data) => {
+            if (data) {
+                const address = data.address || {};
+                const street = address.road || '';
+                const number = address.house_number || 'S/N';
+                const city = address.city || address.town || address.village || 'Ciudad no especificada';
+                const postal = address.postcode || 'No especificado';
+
+                document.getElementById('address-street').textContent = street;
+                document.getElementById('address-number').textContent = number;
+                document.getElementById('address-city').textContent = city;
+                document.getElementById('address-postal').textContent = postal;
             } else {
-                console.error('Geocoder falló debido a: ' + status);
+                console.error('Error en reverse geocoding');
                 document.getElementById('address-street').textContent = 'No se pudo determinar';
                 document.getElementById('address-number').textContent = 'N/A';
                 document.getElementById('address-city').textContent = 'No se pudo determinar';
@@ -963,26 +1157,132 @@ $csrf_token = generateCSRFToken();
         });
     }
 
-    // Función para reportar ubicación actual
+    // Función para inicializar el autocompletado de direcciones
+    function initAutocomplete() {
+        const input = document.getElementById('addressSearch');
+        let timeoutId;
+
+        input.addEventListener('input', function() {
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => {
+                const query = input.value.trim();
+                if (query.length < 3) return;
+
+                geocoder.geocode(query, (results) => {
+                    const resultsContainer = document.getElementById('searchResults');
+                    resultsContainer.innerHTML = '';
+
+                    if (results.length === 0) {
+                        resultsContainer.style.display = 'none';
+                        return;
+                    }
+
+                    results.forEach(result => {
+                        const item = document.createElement('div');
+                        item.className = 'search-result-item';
+                        item.textContent = result.display_name;
+                        item.addEventListener('click', () => {
+                            const latLng = [parseFloat(result.lat), parseFloat(result.lon)];
+                            miniMap.setView(latLng, 17);
+                            addControlMarker.setLatLng(latLng);
+                            document.getElementById('modalLatInput').value = latLng[0];
+                            document.getElementById('modalLngInput').value = latLng[1];
+                            updateAddressFromPlace(result);
+                            resultsContainer.style.display = 'none';
+                        });
+                        resultsContainer.appendChild(item);
+                    });
+
+                    resultsContainer.style.display = 'block';
+                });
+            }, 300);
+        });
+    }
+
+    // Función para reportar ubicación actual (ahora más discreta y sin confirmación)
     function reportarUbicacion() {
-        if (navigator.geolocation) {
-            navigator.geolocation.getCurrentPosition(
-                pos => {
-                    const latLng = new google.maps.LatLng(
-                        pos.coords.latitude,
-                        pos.coords.longitude
-                    );
-                    openAddControlModal(latLng);
-                    updateAddressFromLatLng(latLng);
-                },
-                err => {
-                    alert("No se pudo obtener la ubicación. Asegúrate de haber permitido el acceso a la ubicación.");
-                },
-                {enableHighAccuracy: true}
-            );
-        } else {
-            alert("Tu navegador no soporta geolocalización.");
+        if (!navigator.geolocation) {
+            Toastify({
+                text: "Tu navegador no soporta geolocalización",
+                duration: 3000,
+                backgroundColor: "#dc3545"
+            }).showToast();
+            return;
         }
+
+        // Mostrar feedback visual de que se está procesando
+        const btn = document.getElementById('reportButton');
+        btn.innerHTML = '<div class="spinner-border spinner-border-sm text-white" role="status"></div>';
+        btn.style.backgroundColor = '#ffc107';
+
+        navigator.geolocation.getCurrentPosition(
+            pos => {
+                // Crear formulario oculto y enviar automáticamente
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.style.display = 'none';
+
+                const csrf = document.createElement('input');
+                csrf.type = 'hidden';
+                csrf.name = 'csrf_token';
+                csrf.value = '<?= $csrf_token ?>';
+
+                const lat = document.createElement('input');
+                lat.type = 'hidden';
+                lat.name = 'lat';
+                lat.value = pos.coords.latitude;
+
+                const lng = document.createElement('input');
+                lng.type = 'hidden';
+                lng.name = 'lng';
+                lng.value = pos.coords.longitude;
+
+                const desc = document.createElement('input');
+                desc.type = 'hidden';
+                desc.name = 'descripcion';
+                desc.value = 'Control detectado';
+
+                const anonimo = document.createElement('input');
+                anonimo.type = 'hidden';
+                anonimo.name = 'anonimo';
+                anonimo.value = 'on';
+
+                const submit = document.createElement('input');
+                submit.type = 'hidden';
+                submit.name = 'guardar_control';
+
+                form.appendChild(csrf);
+                form.appendChild(lat);
+                form.appendChild(lng);
+                form.appendChild(desc);
+                form.appendChild(anonimo);
+                form.appendChild(submit);
+                document.body.appendChild(form);
+                form.submit();
+            },
+            err => {
+                console.error("Error de geolocalización:", err);
+                btn.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                        <line x1="12" y1="9" x2="12" y2="13"></line>
+                        <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                    </svg>
+                `;
+                btn.style.backgroundColor = '#dc3545';
+
+                Toastify({
+                    text: "No se pudo obtener tu ubicación",
+                    duration: 3000,
+                    backgroundColor: "#dc3545"
+                }).showToast();
+            },
+            {
+                enableHighAccuracy: true,
+                maximumAge: 0,
+                timeout: 5000
+            }
+        );
     }
 
     // Función para escapar HTML
@@ -1018,6 +1318,12 @@ $csrf_token = generateCSRFToken();
             backgroundColor: "#dc3545",
         }).showToast();
     <?php endif; ?>
+
+    // Asignar evento al botón de reporte
+    document.getElementById('reportButton').addEventListener('click', reportarUbicacion);
+
+    // Inicializar el mapa cuando se cargue el DOM
+    document.addEventListener('DOMContentLoaded', initMap);
 </script>
 </body>
 </html>
